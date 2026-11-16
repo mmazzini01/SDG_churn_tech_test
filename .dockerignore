@@ -1,0 +1,4 @@
+# Only the dependency manifests enter the build context; code and data are mounted at runtime.
+*
+!pyproject.toml
+!uv.lock

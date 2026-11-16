@@ -1,0 +1,175 @@
+paths:
+  raw_data: data/raw/dataset.csv
+
+target: churn
+seed: 42
+test_size: 0.2              # stratified hold-out, untouched until the final evaluation
+# Customer_ID is a key, never a feature; ethnic is a GDPR art. 9 special category (and a fairness risk).
+exclude: [Customer_ID, ethnic]
+
+# Conformity cleaning, on the whole file before the split: fixed row-wise rules, no statistics, no target.
+cleaning:
+  # Codes that mean "unknown" become NaN, checked against the dictionary and the levels in the data.
+  # U is a real level in prizm_social_one (Urban), crclscod (a credit class) and kid* (only U/Y exist, so
+  # U = no child recorded). The literal "NA" in hnd_webcap is a level too (see load_raw): UNKW is its unknown.
+  unknown_codes: {new_cell: [U], marital: [U], dualband: [U], hnd_webcap: [UNKW]}
+  # A handset age cannot be negative: the -1..-5 day values are a date offset, so they become 0 (a new handset).
+  clip_lower: {eqpdays: 0}
+
+# Domain checks, reported on the raw and the cleaned file; they change no value.
+conformity:
+  # Despite their description these are differences (minutes, revenue), not percentages, so they can be
+  # negative: the rule avg3mou + change_mou >= 0 below holds, while 23% of change_mou is below -100.
+  allow_negative: [change_mou, change_rev]
+  # Cross-column relations expected from the definitions: pandas expressions that are True on a violation.
+  rules:
+    - actvsubs > uniqsubs
+    - actvsubs < 1
+    - models > phones
+    - comp_vce_Mean > plcd_vce_Mean
+    - comp_dat_Mean > plcd_dat_Mean
+    - abs(attempt_Mean - plcd_vce_Mean - plcd_dat_Mean) > 0.01
+    - abs(complete_Mean - comp_vce_Mean - comp_dat_Mean) > 0.01
+    - abs(drop_blk_Mean - drop_vce_Mean - drop_dat_Mean - blck_vce_Mean - blck_dat_Mean) > 0.01
+    - abs(ovrrev_Mean - vceovr_Mean - datovr_Mean) > 0.01
+    - ccrndmou_Mean < cc_mou_Mean - 0.01       # rounded care minutes below the unrounded ones
+    - adjmou > totmou + 0.01
+    - adjqty > totcalls
+    - adjrev > totrev + 0.01
+    - mou_Mean > 44640                         # more minutes than a 31-day month has
+    - eqpdays > months * 30.44 + 31            # handset older than the tenure (whole months)
+    - avg3mou + change_mou < -0.5              # implied last month below zero minutes (0.5: rounding)
+
+# Variable families, matched by column-name prefix (case-insensitive). The longest matching prefix wins.
+families:
+  revenue: [rev_, totmrc, ovrrev, vceovr, datovr, totrev, adjrev, avgrev, avg3rev, avg6rev]
+  usage: [mou_, ovrmou, da_, roam, unan_, plcd_, recv_, comp_, inonemin, threeway, owylis, mouowylisv, iwylis,
+          mouiwylisv, peak_, opk_, attempt, complete, callfwdv, callwait, totcalls, totmou, adj, avg]
+  trend: [change_]
+  quality: [drop_, blck_]
+  care: [custcare, ccrndmou, cc_mou]
+  account: [months, uniqsubs, actvsubs, new_cell, crclscod, asl_flag, area]
+  handset: [eqpdays, hnd_, phones, models, dualband, refurb_new]
+  household: [prizm, truck, rv, ownrent, lor, dwlltype, marital, adults, infobase, income, numbcars,
+              hhstatin, dwllsize, forgntvl, kid, creditcd]
+
+# Ratios that take the customer's scale out of a raw signal: heavy users have more minutes, revenue and dropped
+# calls, and churn less, so the raw columns mostly measure size. name: [numerator, denominator].
+# Each name starts with its numerator's family prefix, so it inherits that family.
+features:
+  ratios:
+    mou_vs_lifetime: [mou_Mean, avgmou]           # current usage against the customer's own lifetime average
+    rev_per_mou: [rev_Mean, mou_Mean]             # price paid per minute of use
+    drop_blk_rate: [drop_blk_Mean, attempt_Mean]  # share of attempted calls that were dropped or blocked
+  # The customer against his own last three months: the recent drop, where mou_vs_lifetime is the drop against the
+  # whole life. change_mou / change_rev are differences (EDA 2c), so over the 3-month average they become the
+  # percentage change the data dictionary describes: -100 minutes is a lot for a 200-minute user, little for 2,000.
+  trend:
+    mou_vs_avg3: [mou_Mean, avg3mou]
+    rev_vs_avg3: [rev_Mean, avg3rev]
+    change_mou_pct: [change_mou, avg3mou]
+    change_rev_pct: [change_rev, avg3rev]
+
+model:
+  cv_folds: 5
+  # Cut for the precision, recall and F1 columns of cv_metrics. Each final model has its own cut, chosen by max F1 on
+  # the out-of-fold training predictions (logistic_final / xgboost_final.threshold).
+  threshold: 0.5
+  # One indicator per block of numeric columns missing on the same rows (EDA section 4, training set), not one per
+  # column: a 9-column block would otherwise split one effect across 9 identical columns.
+  missing_indicators: [rev_Mean, change_mou, avg6mou, hnd_price, truck, numbcars, lor, income, adults]
+  min_frequency: 0.005      # rarer categorical levels are pooled; unseen levels at scoring land there too
+  # sklearn's default L2 (C = 1): negligible against 64k rows, but it keeps the solver stable on near-duplicates.
+  baseline: {C: 1.0, max_iter: 2000}
+  elastic_net:
+    # C path from strong (almost every coefficient zero) to none at all, past C = 1 so the best is not on the edge.
+    log10_C: [-4, 2]
+    n_Cs: 19
+    l1_ratios: [0.2, 0.5, 0.8]
+    # A proper scoring rule: it rewards calibrated probabilities and is less flat near the optimum than ROC-AUC.
+    scoring: neg_log_loss
+    max_iter: 1000
+    tol: 0.001
+  # The elastic net with the best CV log-loss in the logistic-regression notebook (the linear benchmark), and its cut.
+  logistic_final: {C: 100.0, l1_ratio: 0.2, threshold: 0.3387}
+  xgboost:
+    params: {tree_method: hist, n_jobs: -1}
+    # Bayesian search (Optuna TPE) ranges, [low, high]; integer bounds give integers.
+    search:
+      max_depth: [3, 10]            # how many variables a tree can combine
+      min_child_weight: [1.0, 10.0] # smallest leaf (in hessian units): larger = fewer splits on few customers
+      learning_rate: [0.01, 0.2]    # drawn on a log scale
+      n_trees: [200, 1200]
+      subsample: [0.6, 1.0]         # share of rows each tree sees
+      colsample_bytree: [0.6, 1.0]  # share of columns each tree sees
+    n_trials: 40
+    # The XGBoost of phase 4 (depth by the one-SE rule, trees by the CV learning curve): it decides the trend features
+    # before the search, so the search runs once, on the final inputs.
+    before_tuning: {max_depth: 4, n_trees: 757, learning_rate: 0.05, subsample: 0.8, colsample_bytree: 0.8}
+  # The XGBoost with the best CV log-loss in the XGBoost notebook, and its cut.
+  xgboost_final: {max_depth: 8, n_trees: 913, learning_rate: 0.0138, min_child_weight: 5.005, subsample: 0.8818,
+                  colsample_bytree: 0.6946, threshold: 0.3257}
+  # Additive model: each numeric becomes a cubic B-spline basis on the signed-log scale, with knots at quantiles of the
+  # training values (equal numbers of customers between knots), then one ridge-penalised logistic regression.
+  # The number of knots and C are chosen together by CV with the one-SE rule (fewest columns, then the most penalty).
+  gam:
+    n_knots: [5, 10, 15]      # n_knots + degree - 2 columns per variable: 6 / 11 / 16
+    degree: 3
+    log10_C: [-4, 0]
+    n_Cs: 9
+    scoring: neg_log_loss
+    max_iter: 2000
+    # Folds fitted at once: each holds its own copy of the ~1,000-column spline design (1-2 GB); 5 filled 16 GB of RAM.
+    n_jobs: 2
+    # Pairs given a tensor-product surface on top of their two curves: the strongest XGBoost SHAP interactions on a
+    # CV fold of the training set that read as a business question (usage-trend twins left out). [x axis, lines].
+    tensors: [[eqpdays, months], [eqpdays, hnd_price], [months, totmrc_Mean]]
+    tensor_knots: 5           # per variable of a pair: 6 x 6 = 36 columns; the main curves keep the fine detail
+    # Values of each pair's second variable at which its joint curve is drawn.
+    tensor_lines:
+      months: [8, 11, 12, 15, 24, 36]
+      hnd_price: [29.99, 59.99, 99.99, 149.99, 199.99]
+      totmrc_Mean: [20, 30, 45, 60, 90]
+    # Two values of the x variable whose difference is read on each line: the handset step and the tenure peak.
+    tensor_contrast: {eqpdays: [270, 330], months: [8, 12]}
+    # A line is drawn only over the x values of the training customers nearest to it (1st-99th percentile).
+    tensor_support: 1000
+
+shap:
+  top_n: 20
+  # |Spearman(value, SHAP)| from which a variable gets a direction (+/-); below it the shape is what matters.
+  monotonic_rho: 0.5
+  # Bands for the mean SHAP and churn rate behind the numbers quoted in the notebook: [lower, upper) edges.
+  bands:
+    eqpdays: [0, 240, 270, 300, 330, 360, 420, 600, 2000]
+    mou_vs_lifetime: [0, 0.01, 0.25, 0.5, 0.75, 0.85, 1.1, 1.5, 100]
+    change_mou: [-5000, -400, -200, -100, -50, 0, 50, 100, 200, 5000]
+    uniqsubs: [1, 2, 3, 4, 6, 200]
+    totmrc_Mean: [-100, 20, 30, 40, 60, 75, 100, 500]
+    lor: [0, 2, 4, 6, 10, 20]
+    hnd_price: [0, 30, 60, 100, 160, 1000]
+
+eda:
+  n_bins: 10
+  min_bin_size: 100           # smaller bins are not plotted: their churn rate is noise
+  min_pct_missing: 0.1        # columns with fewer missing values are left out of the missing-value charts
+  near_constant_share: 0.95   # top value covering at least this share of rows
+  long_tail_skew: 2.0
+  top_n_ranking: 25
+  n_representatives: 6
+  must_include: [months, eqpdays]
+  chi2_min_expected: 5        # rarer levels are pooled into Other, for the chi-square test only
+  top_n_corr: 20              # heatmap only; pairs and groups use every numeric column
+  corr_threshold: 0.8         # |Spearman rho| at which pairs are listed and grouped
+  redundancy_threshold: 0.9   # extreme pairs: the weaker variable by MI becomes a removal candidate
+  negligible_auc_strength: 0.01   # |AUC - 0.5| below this and MI below the median: negligible signal
+  outlier_variables: [rev_Mean, mou_Mean, change_mou, eqpdays]
+  focus_bins:
+    months: [6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30,
+             31, 32, 33, 34, 35, 36, 62]
+    eqpdays: [0, 30, 60, 90, 120, 150, 180, 210, 240, 270, 300, 330, 360, 390, 420, 450, 480, 510, 540,
+              570, 600, 630, 660, 690, 720, 1830]
+  # Coarse bands for the months x eqpdays grid, around the two risk peaks.
+  grid_bins:
+    months: [6, 11, 13, 19, 25, 62]
+    eqpdays: [0, 300, 360, 720, 1830]

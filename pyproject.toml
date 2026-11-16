@@ -1,0 +1,41 @@
+[project]
+name = "churn"
+version = "0.1.0"
+description = "Telco churn model, insights and Airflow pipeline"
+readme = "README.md"
+authors = [
+    { name = "mmazzini01", email = "matteo.mazzini@studenti.it" }
+]
+# Must match the Python of the Airflow image (Dockerfile) so uv.lock resolves the same way in both.
+requires-python = "==3.12.*"
+dependencies = [
+    "joblib>=1.6.0",
+    "numpy>=2.5.4",
+    "pandas>=3.1.1",
+    "pyyaml>=6.0.3",
+    "scikit-learn>=1.9.1",
+    "scipy>=1.18.1",
+    "xgboost-cpu>=3.4.1",
+]
+
+[build-system]
+requires = ["uv_build>=0.12.10,<0.13.0"]
+build-backend = "uv_build"
+
+[tool.uv]
+# The lock must stay installable next to Airflow's own packages in the image.
+# flask-appbuilder (UI login) and botocore require python-dateutil<3.
+constraint-dependencies = ["python-dateutil<3"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[dependency-groups]
+dev = [
+    "ipykernel>=7.4.0",
+    "matplotlib>=3.11.2",
+    "nbconvert>=7.17.2",
+    "optuna>=5.1.0",
+    "pytest>=9.2.0",
+    "seaborn>=0.13.2",
+]
