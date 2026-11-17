@@ -1,4 +1,92 @@
-# SDG_churn_tech_test
+# Telco churn: drivers, model and weekly pipeline
+
+Which customers of a telco are about to leave, and why. The project analyses the drivers of churn (globally and for a
+single customer), compares an interpretable elastic-net logistic regression with XGBoost, and retrains and evaluates
+both every week in an Airflow DAG running in Docker.
+
+## Quickstart
+
+Requirements: Docker Desktop (WSL2 backend on Windows) and [just](https://github.com/casey/just).
+
+```bash
+# 1. put the dataset (not in the repo) at data/raw/dataset.csv
+# 2. build the image and start Airflow; the weekly DAG runs once on its own at the first start
+just up
+# 3. open http://localhost:8080 (airflow / airflow), or run the DAG again right away
+just trigger
+```
+
+Without `just`: `docker compose up -d --build`, then trigger `churn_pipeline` from the UI.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    subgraph offline["Offline experiments (uv, host)"]
+        NB["notebooks: EDA, models, interpretation"]
+        TR["train_logistic / train_xgboost<br/>Optuna on 5-fold CV of the training set"]
+        MLF[("MLflow<br/>params, metrics, models")]
+        TR --> MLF
+    end
+    CFG["config/config.yaml<br/>frozen hyperparameters, cuts, quality gates"]
+    TR --> CFG
+    subgraph docker["Docker: Airflow 3, LocalExecutor, Postgres"]
+        P[prepare_data] --> TE[train_elasticnet] --> EE[evaluate_elasticnet]
+        P --> TX[train_xgboost] --> EX[evaluate_xgboost]
+    end
+    CSV[("data/raw/dataset.csv")] --> P
+    CFG --> docker
+```
+
+- **Tuning is offline**: Optuna searches on 5-fold CV of the training set, tracked in MLflow. The DAG refits with the
+  frozen values from config, so the weekly run takes under a minute.
+- **One sklearn `Pipeline` per model**: cleaning, engineered features, encoding and model are fitted on the training
+  rows only and pickled together, so scoring a new customer applies exactly the training-time preprocessing.
+- **The DAG only orchestrates**: the logic lives in `src/churn/`. Tasks hand each other file paths through XCom, while
+  the data stays on the shared volume. The split is stratified with a fixed seed, so every run holds out the same
+  20% of customers.
+- **Quality gate**: each evaluate task logs the hold-out metrics and fails if the PR-AUC drops below the CV mean minus
+  2 fold standard deviations. Tasks retry once for transient errors; evaluate never retries, because a missed gate
+  would only fail again.
+
+## Repository
+
+```
+dags/churn_pipeline.py     the DAG (orchestration only)
+src/churn/
+  data.py                  loading, conformity cleaning, stratified split
+  features.py              engineered features
+  pipeline.py              production pipelines and DAG steps (runtime dependencies only)
+  model.py                 CV, metrics, per-customer contributions, shared by notebooks and scripts
+  train_logistic.py        elastic-net tuning tracked in MLflow (development)
+  train_xgboost.py         XGBoost feature screening and tuning tracked in MLflow (development)
+  eda.py, plots.py         EDA statistics and charts
+config/config.yaml         paths, column lists, hyperparameters, cuts
+notebooks/
+  01_eda                   EDA on the training set
+  02-04                    exploration history: first logistic regression, XGBoost, GAM
+  05-06                    the final models: odds ratios (elastic net), SHAP (XGBoost)
+tests/                     pytest
+```
+
+## Results
+
+The hold-out set holds 20,000 customers; each model was chosen on CV before being scored on it.
+
+| Model | CV PR-AUC | Hold-out PR-AUC | Hold-out ROC-AUC | Cut | Precision | Recall |
+|---|---|---|---|---|---|---|
+| Elastic net (interpretable benchmark) | 0.647 ± 0.005 | 0.651 | 0.668 | 0.50 | 0.62 | 0.61 |
+| XGBoost (production) | 0.690 ± 0.006 | 0.690 | 0.699 | 0.43 | 0.60 | 0.78 |
+
+- **The XGBoost cut** gives the highest out-of-fold recall with a precision of at least 0.6 on the training set.
+- **The top 10% riskiest customers** churn at 80%, against 50% overall.
+
+Main drivers (XGBoost, mean |SHAP| on the hold-out):
+1. **Handset age** (`eqpdays`): the risk steps up at about 300 days.
+2. **Recent usage drop** (`change_mou_pct`): minutes falling by more than half against the last three months.
+3. **Tenure** (`months`): the risk peaks at months 11–12, the end of the first year.
+4. **Usage against the customer's own lifetime average** (`mou_vs_lifetime`): the lower it is, the higher the risk.
+5. **Subscribers in the household** (`uniqsubs`).
 
 ## Reading the metrics
 
@@ -7,3 +95,17 @@ Precision, PR-AUC and the Brier score depend on that prevalence, so the values r
 real population: in production, at the same cut, precision would be lower (more false alarms per churner found)
 and the probabilities would need recalibrating to the real churn rate. Recall and ROC-AUC do not depend on the
 prevalence. Models are compared with each other on the same sample, never against figures from other datasets.
+
+## Development
+
+The Docker image installs only the runtime dependencies from `uv.lock`; notebooks, MLflow and Optuna are in the uv
+dev group.
+
+```bash
+uv sync                  # development environment
+just test                # pytest
+just lint                # ruff
+just mlflow-ui           # experiment runs on http://localhost:5000
+just logistic            # re-run the elastic-net tuning (~15 min)
+just xgb                 # re-run the XGBoost tuning (~30 min)
+```

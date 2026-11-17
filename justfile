@@ -8,9 +8,17 @@ up:
 down:
     docker compose down
 
+# Run the DAG now, without waiting for its weekly schedule
+trigger:
+    docker compose exec airflow-scheduler airflow dags trigger churn_pipeline
+
 # Run the unit tests
 test:
     uv run pytest
+
+# Lint the code and the notebooks
+lint:
+    uvx ruff check .
 
 # Re-run the EDA notebook end to end, saving its outputs in place
 eda:
