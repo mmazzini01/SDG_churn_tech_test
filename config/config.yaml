@@ -1,5 +1,10 @@
 paths:
   raw_data: data/raw/dataset.csv
+  # Files the DAG tasks hand to each other on the shared volume; every run overwrites them.
+  train: data/processed/train.pkl
+  test: data/processed/test.pkl
+  model: data/models/elasticnet.pkl
+  xgb_model: data/models/xgboost.pkl
 
 target: churn
 seed: 42
@@ -134,6 +139,93 @@ model:
     tensor_contrast: {eqpdays: [270, 330], months: [8, 12]}
     # A line is drawn only over the x values of the training customers nearest to it (1st-99th percentile).
     tensor_support: 1000
+
+# Elastic-net logistic regression tracked in MLflow (python -m churn.train_logistic): Optuna search by CV PR-AUC,
+# once on every variable and once with the 3 engineered features.
+logreg:
+  # 20, not 50: in a 50-trial run the CV score was flat (0.6250 +/- 0.0001) for every C from 0.1 to 100 and the
+  # best was within 0.0001 by trial 12, while those weak-penalty fits cost 35-50 s each.
+  n_trials: 20
+  C: [1.0e-4, 100.0]        # drawn on a log scale: 1e-4 -> 1e-3 is as big a step as 10 -> 100
+  l1_ratio: [0.0, 1.0]      # 0 = ridge (shrinks), 1 = lasso (shrinks and drops variables)
+  # Numeric columns without heavy tails on the training set (|skewness| <= 2 and pandas' excess kurtosis <= 10): they
+  # keep their original unit, so their odds ratios read per standard deviation of months, days, dollars. Every other
+  # numeric column (69 of 78) gets the signed log. CV: +0.0025 PR-AUC against the signed log on every column.
+  light_tailed: [months, eqpdays, hnd_price, totmrc_Mean, truck, adults, income, numbcars, lor]
+  # Cut points of the engineered features, read from the EDA on the training set.
+  old_handset_days: 300
+  first_year_end_months: [11, 12]
+  # The model chosen by python -m churn.train_logistic (best CV PR-AUC, engineered features kept). The weekly DAG
+  # refits it on the training rows with these values; tuning stays an offline experiment.
+  final: {C: 0.1575, l1_ratio: 0.539, features: true}
+
+# XGBoost tracked in MLflow (python -m churn.train_xgboost): the same folds, metric (CV PR-AUC), Optuna search and
+# rule for engineered features as logreg above, so the two models are compared on equal terms.
+xgb:
+  # 40, not 75: in a 75-trial run the base model's best CV PR-AUC was 0.6822 after 40 trials and 0.6826 after 75
+  # (+0.0004, a fifteenth of the fold standard deviation), while a trial costs ~20 s (time grows with trees x depth).
+  n_trials: 40
+  # Fixed, so the search tunes the trees, not the step size (a smaller step only trades for more trees).
+  params: {learning_rate: 0.05, tree_method: hist}
+  # Optuna ranges, [low, high]; min_child_weight and reg_lambda are drawn on a log scale.
+  search:
+    n_estimators: [100, 1000]
+    max_depth: [2, 8]             # how many variables one tree can combine
+    min_child_weight: [1.0, 20.0] # smallest leaf (hessian units): larger = no splits on a handful of customers
+    subsample: [0.6, 1.0]         # share of rows each tree sees
+    colsample_bytree: [0.5, 1.0]  # share of columns each tree sees
+    reg_lambda: [1.0e-3, 10.0]    # L2 penalty on the leaf values
+  # Engineered features are pandas expressions on the raw columns. Trees find steps on one variable by themselves
+  # (old handset, end of the first year), but they draw a ratio of two variables only as a staircase of many splits.
+  # Kept in every engineered model: this month's minutes against the customer's own lifetime average (#3-4 by SHAP).
+  base_feature: {mou_vs_lifetime: mou_Mean / avgmou}
+  # Compared by python -m churn.train_xgboost --screen, each added to mou_vs_lifetime.
+  candidates:
+    # Price: what the customer pays per minute used; paying a lot for little use is a reason to leave.
+    rev_per_mou: rev_Mean / mou_Mean
+    # Price: share of the bill spent outside the plan; a plan that no longer fits the usage.
+    overage_share: ovrrev_Mean / rev_Mean
+    # Service quality: dropped calls per voice call. Raw dropped calls mostly measure volume (heavy users drop more
+    # and churn less); at equal usage they raise churn (logistic, phase 3).
+    drop_vce_rate: drop_vce_Mean / (plcd_vce_Mean + recv_vce_Mean)
+    # Handset: days of handset age per month of tenure; ~30 = still the handset bought at sign-up. months x eqpdays is
+    # the strongest XGBoost SHAP interaction (phase 5b).
+    eqpdays_per_month: eqpdays / months
+    # Usage trend: change_mou is a difference in minutes (EDA 2c); over the 3-month average it becomes the percentage
+    # change, so -100 minutes counts more for a light user than for a heavy one (#3 by SHAP in phase 6).
+    change_mou_pct: change_mou / avg3mou
+    # Usage trend: this month against the last three, the recent drop (mou_vs_lifetime is the drop against the
+    # whole life).
+    mou_vs_avg3: mou_Mean / avg3mou
+  # The candidates chosen after the screening, added to base_feature. Only the usage-trend family helped (+0.0056
+  # +/- 0.0016 paired CV PR-AUC, 5/5 folds); mou_vs_avg3 measures the same drop (Spearman 0.98); price, quality and
+  # handset ratios stayed within noise (|delta| <= 0.0006).
+  chosen: [change_mou_pct]
+  # The phase-4 model (depth by the one-SE rule, trees by the CV learning curve, learning rate 0.05 as above):
+  # fixed parameters, so the screening compares features, not tuning luck.
+  screen_params: {n_estimators: 757, max_depth: 4, subsample: 0.8, colsample_bytree: 0.8}
+  # The cut: the highest recall with at least this precision on the out-of-fold training predictions. Not 0.5: on a
+  # sample with 49.6% churners, flagging everyone already gives precision 0.5.
+  min_precision: 0.6
+  # The model chosen by python -m churn.train_xgboost (MLflow run xgb_final): engineered features kept, then the
+  # best CV PR-AUC. Copied at full precision; tuning stays offline. On the same OS a refit reproduces that run exactly.
+  # Across OSes it does not: XGBoost draws the subsample / colsample rows and columns with the C++ library's random
+  # distributions, which differ between the Windows and Linux builds (without sampling the two agree to 6e-8). The
+  # Docker refit is like another seed: hold-out PR-AUC 0.6904 vs 0.6913, 6% of decisions at the cut differ.
+  final:
+    params: {n_estimators: 385, max_depth: 6, min_child_weight: 3.3868401469276983, subsample: 0.8515185405307484,
+             colsample_bytree: 0.7944451595983506, reg_lambda: 3.8852378493680124}
+    features: true
+    threshold: 0.4305405020713806   # max out-of-fold recall with precision >= min_precision
+    # Threads for the DAG fit, fixed instead of "all cores": XGBoost sums its histograms per thread, so the result
+    # depends on the thread count (8 threads: hold-out PR-AUC +0.00014). 16 = the offline run's thread count; fixed,
+    # it gives the same model on a machine with any number of cores (only slower on fewer).
+    n_jobs: 16
+
+mlflow:
+  experiment: telco-churn
+  db: mlflow.db             # runs, parameters and metrics (SQLite file at the repo root)
+  artifacts: mlartifacts    # saved models and files
 
 shap:
   top_n: 20

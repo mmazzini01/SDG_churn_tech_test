@@ -11,6 +11,7 @@ from matplotlib.colors import LinearSegmentedColormap
 from matplotlib.figure import Figure
 from matplotlib.patches import Patch
 from scipy.special import expit
+from sklearn.metrics import average_precision_score, precision_recall_curve
 
 from churn.eda import MISSING
 
@@ -353,5 +354,24 @@ def plot_waterfall(contrib: pd.Series, values: pd.Series, base: float, top_n: in
     ax.grid(axis="x")
     ax.set_xlabel("log-odds of churn")
     ax.set_title(f"Average customer (dotted): p = {expit(base):.2f}  →  this customer (solid): p = {expit(end):.2f}")
+    fig.tight_layout()
+    return fig
+
+
+def plot_pr_curve(y: pd.Series, proba: np.ndarray, threshold: float) -> Figure:
+    """Precision against recall over every cut, the chosen cut marked. The dashed line is the churn rate: the
+    precision of a random list, so the gap above it is what the model adds."""
+    precision, recall, cuts = precision_recall_curve(y, proba)
+    at = np.searchsorted(cuts, threshold)  # first cut >= threshold: the point the chosen cut produces
+    fig, ax = plt.subplots(figsize=(6, 4.2))
+    ax.plot(recall, precision, color=SERIES[0], linewidth=2, label=f"model (PR-AUC {average_precision_score(y, proba):.3f})")
+    ax.axhline(y.mean(), color=INK2, linewidth=1, linestyle=(0, (4, 3)), label=f"random (churn rate {y.mean():.3f})")
+    ax.scatter(recall[at], precision[at], s=40, color=CHURNED, zorder=3,
+               label=f"cut {threshold:.3f}: precision {precision[at]:.3f}, recall {recall[at]:.3f}")
+    ax.set_xlabel("recall: share of churners on the list")
+    ax.set_ylabel("precision: share of the list who churn")
+    ax.set_xlim(0, 1)
+    ax.grid()
+    ax.legend(loc="upper right")  # the empty corner: high precision is reached only at low recall
     fig.tight_layout()
     return fig

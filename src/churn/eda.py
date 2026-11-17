@@ -182,8 +182,17 @@ def _bin(s: pd.Series, bins: int | list, max_levels: int | None = None) -> pd.Se
     else:
         # Fixed bands are labelled by their lower edge: "12" means [12, next edge).
         cat = pd.cut(s, bins, right=False, labels=bins[:-1])
-    cat = cat.cat.rename_categories(lambda c: f"{c:g}" if isinstance(c, (int, float)) else str(c))
+    cat = cat.cat.rename_categories(_label)
     return cat.cat.add_categories(MISSING).fillna(MISSING)
+
+
+def _label(c) -> str:
+    """Bin name: deciles as '(left, right]' rounded to 2 decimals, numbers in their shortest form, levels as they are.
+    Only the name changes, never the bin."""
+    if isinstance(c, pd.Interval):
+        # + 0.0 turns -0.0 (e.g. -0.001 rounded) into 0.0, so no bin reads "-0".
+        return f"({round(c.left, 2) + 0.0:g}, {round(c.right, 2) + 0.0:g}]"
+    return f"{c:g}" if isinstance(c, (int, float)) else str(c)
 
 
 def churn_by_grid(df: pd.DataFrame, rows: str, row_bins: list, cols: str, col_bins: list, target: str,

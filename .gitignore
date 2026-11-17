@@ -3,6 +3,11 @@ data/
 *.pkl
 .env
 
+# MLflow tracking
+mlflow.db
+mlartifacts/
+mlruns/
+
 # Python
 __pycache__/
 *.py[cod]

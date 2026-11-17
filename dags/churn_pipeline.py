@@ -1,15 +1,14 @@
-"""Weekly churn pipeline: prepare data, train the model, evaluate it on the hold-out set."""
+"""Weekly churn pipeline: prepare the data once, then train each model and evaluate it on the hold-out set.
 
-import logging
+    prepare_data -+-> train_elasticnet -> evaluate_elasticnet
+                  +-> train_xgboost    -> evaluate_xgboost
+
+The logic lives in churn.pipeline; the tasks only pass file paths to each other. The two branches run in parallel.
+"""
+
 from datetime import datetime
-from pathlib import Path
 
 from airflow.sdk import dag, task
-
-log = logging.getLogger(__name__)
-
-# ponytail: placeholder tasks that only prove the mounts work; replace with churn.* calls in the integration phase
-DATASET = Path("/opt/airflow/data/raw/dataset.csv")
 
 
 @dag(
@@ -18,26 +17,48 @@ DATASET = Path("/opt/airflow/data/raw/dataset.csv")
     catchup=False,
     # Scheduled runs must start without anyone unpausing the DAG in the UI.
     is_paused_upon_creation=False,
+    # Every run overwrites the same files on the volume, so two runs must never overlap.
+    max_active_runs=1,
 )
 def churn_pipeline():
-    @task
-    def prepare_data() -> None:
-        if not DATASET.exists():
-            raise FileNotFoundError(f"Dataset not mounted: {DATASET}")
-        log.info("Dataset found: %s (%.1f MB)", DATASET, DATASET.stat().st_size / 1e6)
+    # churn is imported inside each task: this file is re-parsed often, and parsing must not load sklearn and pandas.
+
+    @task(multiple_outputs=True)
+    def prepare_data() -> dict[str, str]:
+        from churn import config, pipeline
+
+        return pipeline.prepare_data(config.load_config())
 
     @task
-    def train_model() -> None:
-        # Imported inside the task to keep DAG parsing light.
-        import churn
+    def train_elasticnet(train_path: str) -> str:
+        from churn import config, pipeline
 
-        log.info("churn package imported from %s", churn.__file__)
+        return pipeline.train_elasticnet(config.load_config(), train_path)
 
     @task
-    def evaluate_model() -> None:
-        log.info("Evaluation placeholder: hold-out metrics will be logged here")
+    def train_xgboost(train_path: str) -> str:
+        from churn import config, pipeline
 
-    prepare_data() >> train_model() >> evaluate_model()
+        return pipeline.train_xgboost(config.load_config(), train_path)
+
+    # Metrics go to the task log only: XCom carries paths, not results. Each model is scored at its own cut.
+    @task
+    def evaluate_elasticnet(model_path: str, train_path: str, test_path: str) -> None:
+        from churn import config, pipeline
+
+        cfg = config.load_config()
+        pipeline.evaluate(cfg, model_path, train_path, test_path, cfg["model"]["threshold"])
+
+    @task
+    def evaluate_xgboost(model_path: str, train_path: str, test_path: str) -> None:
+        from churn import config, pipeline
+
+        cfg = config.load_config()
+        pipeline.evaluate(cfg, model_path, train_path, test_path, cfg["xgb"]["final"]["threshold"])
+
+    paths = prepare_data()
+    evaluate_elasticnet(train_elasticnet(paths["train"]), paths["train"], paths["test"])
+    evaluate_xgboost(train_xgboost(paths["train"]), paths["train"], paths["test"])
 
 
 churn_pipeline()

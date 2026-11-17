@@ -70,3 +70,9 @@ def test_redundancy_groups_and_greedy_candidates():
     out = eda.removal_candidates(rank, corr, extreme=0.9, negligible=0.01).set_index("variable")["reason"]
     assert set(out.index) == {"b", "d"}
     assert out["b"].startswith("near-duplicate of a") and out["d"].startswith("negligible")
+
+
+def test_bin_labels_rounded_to_two_decimals():
+    assert eda._label(pd.Interval(-1.4869999999999999, -0.573)) == "(-1.49, -0.57]"
+    assert eda._label(pd.Interval(-0.001, 93.0)) == "(0, 93]"  # no "-0", no trailing zeros
+    assert eda._label(12.0) == "12" and eda._label("A") == "A"
