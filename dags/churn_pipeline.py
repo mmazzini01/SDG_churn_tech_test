@@ -1,14 +1,16 @@
-"""Weekly churn pipeline: prepare the data once, then train each model and evaluate it on the hold-out set.
+"""Weekly churn pipeline: prepare the data once, train each model, evaluate it on the hold-out set, and publish the
+churn scores of the production model.
 
     prepare_data -+-> train_elasticnet -> evaluate_elasticnet
-                  +-> train_xgboost    -> evaluate_xgboost
+                  +-> train_xgboost    -> evaluate_xgboost -> publish_scores
 
 The logic lives in churn.pipeline; the tasks only pass file paths to each other. The two branches run in parallel.
+The split, the metrics and the scores also go to the business database (CHURN_DB_URL in docker-compose.yaml).
 """
 
 from datetime import datetime, timedelta
 
-from airflow.sdk import dag, task
+from airflow.sdk import dag, get_current_context, task
 
 
 @dag(
@@ -43,15 +45,15 @@ def churn_pipeline():
 
         return pipeline.train_xgboost(config.load_config(), train_path)
 
-    # Metrics go to the task log only: XCom carries paths, not results. Each model is scored at its own cut and fails
-    # the task if it misses its quality gate. No retry: a missed gate is deterministic and would only fail again.
+    # Metrics go to the task log and the database: XCom carries paths, not results. Each model is scored at its own
+    # cut and fails the task if it misses its quality gate. No retry: a missed gate would only fail again.
     @task(retries=0)
     def evaluate_elasticnet(model_path: str, train_path: str, test_path: str) -> None:
         from churn import config, pipeline
 
         cfg = config.load_config()
         pipeline.evaluate(cfg, model_path, train_path, test_path, cfg["model"]["threshold"],
-                          cfg["logreg"]["final"]["min_pr_auc"])
+                          cfg["logreg"]["final"]["min_pr_auc"], get_current_context()["run_id"])
 
     @task(retries=0)
     def evaluate_xgboost(model_path: str, train_path: str, test_path: str) -> None:
@@ -59,11 +61,20 @@ def churn_pipeline():
 
         cfg = config.load_config()
         final = cfg["xgb"]["final"]
-        pipeline.evaluate(cfg, model_path, train_path, test_path, final["threshold"], final["min_pr_auc"])
+        pipeline.evaluate(cfg, model_path, train_path, test_path, final["threshold"], final["min_pr_auc"],
+                          get_current_context()["run_id"])
+
+    # Runs only if XGBoost passed its quality gate: a model that got worse never reaches the retention list.
+    @task
+    def publish_scores(model_path: str, test_path: str) -> None:
+        from churn import config, pipeline
+
+        pipeline.publish_scores(config.load_config(), model_path, test_path, get_current_context()["run_id"])
 
     paths = prepare_data()
     evaluate_elasticnet(train_elasticnet(paths["train"]), paths["train"], paths["test"])
-    evaluate_xgboost(train_xgboost(paths["train"]), paths["train"], paths["test"])
+    xgb_model = train_xgboost(paths["train"])
+    evaluate_xgboost(xgb_model, paths["train"], paths["test"]) >> publish_scores(xgb_model, paths["test"])
 
 
 churn_pipeline()

@@ -7,6 +7,7 @@ paths:
   xgb_model: data/models/xgboost.pkl
 
 target: churn
+id: Customer_ID             # the key of the database tables
 seed: 42
 test_size: 0.2              # stratified hold-out, untouched until the final evaluation
 # Customer_ID is a key, never a feature; ethnic is a GDPR art. 9 special category (and a fairness risk).
@@ -228,6 +229,18 @@ xgb:
     # depends on the thread count (8 threads: hold-out PR-AUC +0.00014). 16 = the offline run's thread count; fixed,
     # it gives the same model on a machine with any number of cores (only slower on fewer).
     n_jobs: 16
+  # Retention action for a flagged customer, from the variable that pushes his risk up the most (TreeSHAP). These
+  # seven are the top driver of 92% of the flagged hold-out customers. A suggestion for the retention team, not a
+  # causal effect: what an offer really changes is measured with an A/B test.
+  actions:
+    eqpdays: handset upgrade offer
+    hnd_price: handset upgrade offer
+    months: renewal offer around the end of the first year
+    change_mou_pct: proactive call, usage is dropping
+    mou_vs_lifetime: proactive call, usage is dropping
+    totmrc_Mean: plan review
+    uniqsubs: review of the lines on the account
+  default_action: standard retention contact
 
 mlflow:
   experiment: telco-churn

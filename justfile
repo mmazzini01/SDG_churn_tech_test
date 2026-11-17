@@ -12,6 +12,10 @@ down:
 trigger:
     docker compose exec airflow-scheduler airflow dags trigger churn_pipeline
 
+# Open psql on the business database (split, model_metrics, churn_scores)
+db:
+    docker compose exec churn-db psql -U churn -d churn
+
 # Run the unit tests
 test:
     uv run pytest

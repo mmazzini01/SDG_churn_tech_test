@@ -1,12 +1,15 @@
 """The production models (elastic net, XGBoost) and the steps of the Airflow DAG: prepare the data, train each model,
-evaluate it on the hold-out.
+evaluate it on the hold-out, publish the churn scores.
 
 Steps hand data to each other as files on the shared volume: each one returns the path it wrote. They need only the
 runtime dependencies, so the Airflow image can import this module (mlflow, optuna and matplotlib are development-only).
+The split, the metrics of every run and the churn scores also go to the business database (CHURN_DB_URL).
 """
 
 import logging
+import os
 import pickle
+from datetime import UTC, datetime
 from pathlib import Path
 
 import numpy as np
@@ -23,7 +26,7 @@ from churn.config import ROOT
 from churn.data import clean, load_raw, split
 from churn.eda import MISSING
 from churn.features import add_features, add_features_xgb
-from churn.model import _level_name, metrics, split_xy
+from churn.model import _level_name, metrics, split_xy, tree_contributions
 
 log = logging.getLogger(__name__)
 
@@ -91,13 +94,29 @@ def _output(cfg: dict, key: str) -> Path:
     return path
 
 
+def _write(df: pd.DataFrame, table: str, if_exists: str) -> None:
+    """Write a table to the business database, a Postgres apart from Airflow's own metadata database."""
+    # SQLAlchemy and psycopg come with the Airflow image (its metadata database and Postgres provider use them).
+    # Declaring SQLAlchemy in pyproject would pin the lock's 2.1 (pulled in by mlflow) over the image's 2.0, the
+    # version Airflow's own constraints ship with.
+    from sqlalchemy import create_engine
+
+    engine = create_engine(os.environ["CHURN_DB_URL"])
+    with engine.begin() as conn:
+        df.to_sql(table, conn, if_exists=if_exists, index=False)
+    engine.dispose()
+
+
 def prepare_data(cfg: dict) -> dict[str, str]:
     """Raw CSV -> stratified train / hold-out split (same config, so the same customers as the notebooks).
-    DataFrame pickles keep the dtypes, e.g. the "NA" level of hnd_webcap, without a parquet engine in the image."""
+    DataFrame pickles keep the dtypes, e.g. the "NA" level of hnd_webcap, without a parquet engine in the image.
+    Which customer is in which set also goes to the database, so other tables can be joined to it."""
     train, test = split(load_raw(ROOT / cfg["paths"]["raw_data"]), cfg["target"], cfg["test_size"], cfg["seed"])
     paths = {"train": _output(cfg, "train"), "test": _output(cfg, "test")}
     train.to_pickle(paths["train"])
     test.to_pickle(paths["test"])
+    ids = pd.concat([train[[cfg["id"]]].assign(dataset="train"), test[[cfg["id"]]].assign(dataset="test")])
+    _write(ids, "split", "replace")
     return {name: str(path) for name, path in paths.items()}
 
 
@@ -133,6 +152,11 @@ def _describe(model) -> str:
             f"{(model.coef_ != 0).sum()} of {model.coef_.size} columns non-zero")
 
 
+def _load(path: str) -> Pipeline:
+    with open(path, "rb") as f:
+        return pickle.load(f)
+
+
 def _check_gate(scores: dict[str, float], min_pr_auc: float) -> None:
     """Quality gate: a model whose hold-out PR-AUC falls below the minimum fails the task instead of passing quietly."""
     passed = scores["pr_auc"] >= min_pr_auc
@@ -142,12 +166,19 @@ def _check_gate(scores: dict[str, float], min_pr_auc: float) -> None:
         raise ValueError(f"hold-out PR-AUC {scores['pr_auc']:.4f} is below the minimum {min_pr_auc:.4f}")
 
 
+def _save_metrics(scores: dict[str, float], model_path: str, run_id: str, threshold: float, min_pr_auc: float) -> None:
+    """Append one row per run and model: the history of the weekly metrics, failed quality gates included."""
+    row = {"run_id": run_id, "model": Path(model_path).stem, "evaluated_at": datetime.now(UTC), **scores,
+           "threshold": threshold, "min_pr_auc": min_pr_auc, "passed": scores["pr_auc"] >= min_pr_auc}
+    _write(pd.DataFrame([row]), "model_metrics", "append")
+
+
 def evaluate(cfg: dict, model_path: str, train_path: str, test_path: str, threshold: float,
-             min_pr_auc: float) -> dict[str, float]:
+             min_pr_auc: float, run_id: str) -> dict[str, float]:
     """Load the pickled pipeline, score it on the hold-out set, and log the run: data, model, metrics on the
-    probabilities, then the decisions at the cut. Raises if the PR-AUC fails the quality gate."""
-    with open(model_path, "rb") as f:
-        pipe = pickle.load(f)
+    probabilities, then the decisions at the cut. The metrics are saved to the database, then the quality gate
+    raises if the PR-AUC is too low."""
+    pipe = _load(model_path)
     test = pd.read_pickle(test_path)
     for name, df in [("train", pd.read_pickle(train_path)), ("test", test)]:
         log.info("%-5s %6d rows, churn rate %.3f", name, len(df), df[cfg["target"]].mean())
@@ -162,5 +193,25 @@ def evaluate(cfg: dict, model_path: str, train_path: str, test_path: str, thresh
     log.info("hold-out metrics at the cut, threshold = %.4f (churn if probability >= threshold):", threshold)
     for name in ["precision", "recall", "f1"]:
         log.info("  %-9s %.4f", name, scores[name])
+    _save_metrics(scores, model_path, run_id, threshold, min_pr_auc)
     _check_gate(scores, min_pr_auc)
     return scores
+
+
+def publish_scores(cfg: dict, model_path: str, test_path: str, run_id: str) -> None:
+    """Score the hold-out customers with XGBoost and replace the churn_scores table: probability, flag at the cut, the
+    variable pushing each customer's risk up the most (TreeSHAP), and the retention action it suggests if flagged."""
+    pipe = _load(model_path)
+    test = pd.read_pickle(test_path)
+    X, _ = split_xy(test, cfg)
+    xgb = cfg["xgb"]
+    proba = pipe.predict_proba(X)[:, 1]
+    flagged = proba >= xgb["final"]["threshold"]
+    driver = tree_contributions(pipe, X)[0].idxmax(axis=1)
+    action = driver.map(xgb["actions"]).fillna(xgb["default_action"]).where(flagged)
+    scores = pd.DataFrame({cfg["id"]: test[cfg["id"]], "churn_probability": proba, "flagged": flagged,
+                           "top_driver": driver, "suggested_action": action, "run_id": run_id})
+    _write(scores, "churn_scores", "replace")
+    # Counts only: customer rows never go to the log.
+    log.info("published %d scores, %d flagged; actions: %s", len(scores), flagged.sum(),
+             action.value_counts().to_dict())
