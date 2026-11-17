@@ -1,5 +1,6 @@
 import numpy as np
 import pandas as pd
+import pytest
 
 from churn import pipeline
 
@@ -31,9 +32,12 @@ def test_dag_steps_round_trip(tmp_path):
 
     paths = pipeline.prepare_data(cfg)
     model_path = pipeline.train_elasticnet(cfg, paths["train"])
-    scores = pipeline.evaluate(cfg, model_path, paths["train"], paths["test"], threshold=0.5)
+    scores = pipeline.evaluate(cfg, model_path, paths["train"], paths["test"], threshold=0.5, min_pr_auc=0.5)
     xgb_path = pipeline.train_xgboost(cfg, paths["train"])
-    xgb_scores = pipeline.evaluate(cfg, xgb_path, paths["train"], paths["test"], threshold=0.5)
+    xgb_scores = pipeline.evaluate(cfg, xgb_path, paths["train"], paths["test"], threshold=0.5, min_pr_auc=0.5)
+    # Quality gate: a model below the minimum PR-AUC fails the task.
+    with pytest.raises(ValueError, match="below the minimum"):
+        pipeline.evaluate(cfg, model_path, paths["train"], paths["test"], threshold=0.5, min_pr_auc=0.99)
 
     train, test = pd.read_pickle(paths["train"]), pd.read_pickle(paths["test"])
     assert len(test) == 100 and set(train["id"]).isdisjoint(test["id"])

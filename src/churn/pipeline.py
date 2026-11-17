@@ -133,9 +133,19 @@ def _describe(model) -> str:
             f"{(model.coef_ != 0).sum()} of {model.coef_.size} columns non-zero")
 
 
-def evaluate(cfg: dict, model_path: str, train_path: str, test_path: str, threshold: float) -> dict[str, float]:
+def _check_gate(scores: dict[str, float], min_pr_auc: float) -> None:
+    """Quality gate: a model whose hold-out PR-AUC falls below the minimum fails the task instead of passing quietly."""
+    passed = scores["pr_auc"] >= min_pr_auc
+    log.info("quality gate: %s (hold-out PR-AUC %.4f, minimum %.4f)", "passed" if passed else "FAILED",
+             scores["pr_auc"], min_pr_auc)
+    if not passed:
+        raise ValueError(f"hold-out PR-AUC {scores['pr_auc']:.4f} is below the minimum {min_pr_auc:.4f}")
+
+
+def evaluate(cfg: dict, model_path: str, train_path: str, test_path: str, threshold: float,
+             min_pr_auc: float) -> dict[str, float]:
     """Load the pickled pipeline, score it on the hold-out set, and log the run: data, model, metrics on the
-    probabilities, then the decisions at the cut."""
+    probabilities, then the decisions at the cut. Raises if the PR-AUC fails the quality gate."""
     with open(model_path, "rb") as f:
         pipe = pickle.load(f)
     test = pd.read_pickle(test_path)
@@ -152,4 +162,5 @@ def evaluate(cfg: dict, model_path: str, train_path: str, test_path: str, thresh
     log.info("hold-out metrics at the cut, threshold = %.4f (churn if probability >= threshold):", threshold)
     for name in ["precision", "recall", "f1"]:
         log.info("  %-9s %.4f", name, scores[name])
+    _check_gate(scores, min_pr_auc)
     return scores

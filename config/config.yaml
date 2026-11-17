@@ -66,6 +66,7 @@ features:
     mou_vs_lifetime: [mou_Mean, avgmou]           # current usage against the customer's own lifetime average
     rev_per_mou: [rev_Mean, mou_Mean]             # price paid per minute of use
     drop_blk_rate: [drop_blk_Mean, attempt_Mean]  # share of attempted calls that were dropped or blocked
+  # Notebooks 02-04 only (the production XGBoost takes its features from xgb below).
   # The customer against his own last three months: the recent drop, where mou_vs_lifetime is the drop against the
   # whole life. change_mou / change_rev are differences (EDA 2c), so over the 3-month average they become the
   # percentage change the data dictionary describes: -100 minutes is a lot for a 200-minute user, little for 2,000.
@@ -75,6 +76,9 @@ features:
     change_mou_pct: [change_mou, avg3mou]
     change_rev_pct: [change_rev, avg3rev]
 
+# Settings of the exploration notebooks 02-04. The DAG uses only threshold (the elastic net's cut), min_frequency and
+# elastic_net.max_iter / tol from here; logistic_final, xgboost, xgboost_final and gam are the history of those
+# notebooks, superseded by the production models logreg.final and xgb.final further down.
 model:
   cv_folds: 5
   # Cut for the precision, recall and F1 columns of cv_metrics. Each final model has its own cut, chosen by max F1 on
@@ -95,7 +99,7 @@ model:
     scoring: neg_log_loss
     max_iter: 1000
     tol: 0.001
-  # The elastic net with the best CV log-loss in the logistic-regression notebook (the linear benchmark), and its cut.
+  # Notebook 02 only (superseded by logreg.final): the elastic net with the best CV log-loss, and its cut.
   logistic_final: {C: 100.0, l1_ratio: 0.2, threshold: 0.3387}
   xgboost:
     params: {tree_method: hist, n_jobs: -1}
@@ -111,7 +115,7 @@ model:
     # The XGBoost of phase 4 (depth by the one-SE rule, trees by the CV learning curve): it decides the trend features
     # before the search, so the search runs once, on the final inputs.
     before_tuning: {max_depth: 4, n_trees: 757, learning_rate: 0.05, subsample: 0.8, colsample_bytree: 0.8}
-  # The XGBoost with the best CV log-loss in the XGBoost notebook, and its cut.
+  # Notebook 03 only (superseded by xgb.final): the XGBoost with the best CV log-loss, and its cut.
   xgboost_final: {max_depth: 8, n_trees: 913, learning_rate: 0.0138, min_child_weight: 5.005, subsample: 0.8818,
                   colsample_bytree: 0.6946, threshold: 0.3257}
   # Additive model: each numeric becomes a cubic B-spline basis on the signed-log scale, with knots at quantiles of the
@@ -155,9 +159,11 @@ logreg:
   # Cut points of the engineered features, read from the EDA on the training set.
   old_handset_days: 300
   first_year_end_months: [11, 12]
-  # The model chosen by python -m churn.train_logistic (best CV PR-AUC, engineered features kept). The weekly DAG
-  # refits it on the training rows with these values; tuning stays an offline experiment.
-  final: {C: 0.1575, l1_ratio: 0.539, features: true}
+  # Production: the model chosen by python -m churn.train_logistic (best CV PR-AUC, engineered features kept). The
+  # weekly DAG refits it on the training rows with these values; tuning stays an offline experiment.
+  # min_pr_auc is the quality gate: the DAG fails if the hold-out PR-AUC falls below the CV mean - 2 fold SDs
+  # (0.6469 - 2 x 0.0054).
+  final: {C: 0.1575, l1_ratio: 0.539, features: true, min_pr_auc: 0.636}
 
 # XGBoost tracked in MLflow (python -m churn.train_xgboost): the same folds, metric (CV PR-AUC), Optuna search and
 # rule for engineered features as logreg above, so the two models are compared on equal terms.
@@ -207,8 +213,8 @@ xgb:
   # The cut: the highest recall with at least this precision on the out-of-fold training predictions. Not 0.5: on a
   # sample with 49.6% churners, flagging everyone already gives precision 0.5.
   min_precision: 0.6
-  # The model chosen by python -m churn.train_xgboost (MLflow run xgb_final): engineered features kept, then the
-  # best CV PR-AUC. Copied at full precision; tuning stays offline. On the same OS a refit reproduces that run exactly.
+  # Production: the model chosen by python -m churn.train_xgboost (MLflow run xgb_final): engineered features kept,
+  # then the best CV PR-AUC. Copied at full precision; tuning stays offline. On the same OS a refit reproduces that run exactly.
   # Across OSes it does not: XGBoost draws the subsample / colsample rows and columns with the C++ library's random
   # distributions, which differ between the Windows and Linux builds (without sampling the two agree to 6e-8). The
   # Docker refit is like another seed: hold-out PR-AUC 0.6904 vs 0.6913, 6% of decisions at the cut differ.
@@ -217,6 +223,7 @@ xgb:
              colsample_bytree: 0.7944451595983506, reg_lambda: 3.8852378493680124}
     features: true
     threshold: 0.4305405020713806   # max out-of-fold recall with precision >= min_precision
+    min_pr_auc: 0.678               # quality gate: CV mean - 2 fold SDs (0.6903 - 2 x 0.0060)
     # Threads for the DAG fit, fixed instead of "all cores": XGBoost sums its histograms per thread, so the result
     # depends on the thread count (8 threads: hold-out PR-AUC +0.00014). 16 = the offline run's thread count; fixed,
     # it gives the same model on a machine with any number of cores (only slower on fewer).

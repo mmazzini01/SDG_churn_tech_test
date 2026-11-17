@@ -6,7 +6,7 @@
 The logic lives in churn.pipeline; the tasks only pass file paths to each other. The two branches run in parallel.
 """
 
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from airflow.sdk import dag, task
 
@@ -19,6 +19,8 @@ from airflow.sdk import dag, task
     is_paused_upon_creation=False,
     # Every run overwrites the same files on the volume, so two runs must never overlap.
     max_active_runs=1,
+    # One retry for transient errors (volume, database); the evaluate tasks override it.
+    default_args={"retries": 1, "retry_delay": timedelta(minutes=5)},
 )
 def churn_pipeline():
     # churn is imported inside each task: this file is re-parsed often, and parsing must not load sklearn and pandas.
@@ -41,20 +43,23 @@ def churn_pipeline():
 
         return pipeline.train_xgboost(config.load_config(), train_path)
 
-    # Metrics go to the task log only: XCom carries paths, not results. Each model is scored at its own cut.
-    @task
+    # Metrics go to the task log only: XCom carries paths, not results. Each model is scored at its own cut and fails
+    # the task if it misses its quality gate. No retry: a missed gate is deterministic and would only fail again.
+    @task(retries=0)
     def evaluate_elasticnet(model_path: str, train_path: str, test_path: str) -> None:
         from churn import config, pipeline
 
         cfg = config.load_config()
-        pipeline.evaluate(cfg, model_path, train_path, test_path, cfg["model"]["threshold"])
+        pipeline.evaluate(cfg, model_path, train_path, test_path, cfg["model"]["threshold"],
+                          cfg["logreg"]["final"]["min_pr_auc"])
 
-    @task
+    @task(retries=0)
     def evaluate_xgboost(model_path: str, train_path: str, test_path: str) -> None:
         from churn import config, pipeline
 
         cfg = config.load_config()
-        pipeline.evaluate(cfg, model_path, train_path, test_path, cfg["xgb"]["final"]["threshold"])
+        final = cfg["xgb"]["final"]
+        pipeline.evaluate(cfg, model_path, train_path, test_path, final["threshold"], final["min_pr_auc"])
 
     paths = prepare_data()
     evaluate_elasticnet(train_elasticnet(paths["train"]), paths["train"], paths["test"])
