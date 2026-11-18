@@ -1,4 +1,4 @@
-"""EDA figures: DataFrame in, matplotlib Figure out. All numbers come from churn.eda."""
+"""Figures of the EDA and of the model interpretation: DataFrame in, matplotlib Figure out."""
 
 import math
 from itertools import pairwise
@@ -186,82 +186,16 @@ def plot_outliers(df: pd.DataFrame, cols: list[str], target: str) -> Figure:
     return fig
 
 
-def plot_cv_path(path: pd.DataFrame, best: pd.Series, chosen: pd.Series, by: str = "l1_ratio") -> Figure:
-    """Regularisation path over C, one line per value of `by` (l1_ratio for the elastic net, n_knots for the GAM):
-    CV log-loss (± 1 SE) on top, mean number of non-zero coefficients below. Dotted line: best score; solid line:
-    the chosen configuration (the same one, unless a rule such as one-SE picks another)."""
-    fig, (ax_loss, ax_n) = plt.subplots(2, 1, figsize=(8, 6), sharex=True, height_ratios=[3, 2])
-    for color, (value, p) in zip(SERIES, path.groupby(by)):
-        loss = -p["score"]
-        ax_loss.fill_between(p["C"], loss - p["se"], loss + p["se"], color=color, alpha=0.15, linewidth=0)
-        ax_loss.plot(p["C"], loss, color=color, linewidth=2, marker="o", markersize=4, label=f"{by} {value:g}")
-        ax_n.plot(p["C"], p["n_nonzero"], color=color, linewidth=2, marker="o", markersize=4)
-    for ax in (ax_loss, ax_n):
-        ax.axvline(best["C"], color=INK2, linewidth=1, linestyle=(0, (1, 2)))
-        ax.axvline(chosen["C"], color=INK, linewidth=1)
-        ax.grid(axis="y")
-    ax_loss.set_ylim(top=-path["score"].min() + 0.002)
-    ax_loss.set_ylabel("CV log-loss (lower is better)")
-    ax_loss.set_title(f"Chosen: C = {chosen['C']:.4f}, {by} = {chosen[by]:g}, "
-                      f"{chosen['n_nonzero']:.0f} non-zero columns (best score: C = {best['C']:.4f})")
-    ax_loss.legend(loc="upper right")
-    ax_n.set_xscale("log")
-    ax_n.set_xlabel("C (inverse regularisation strength, log scale)")
-    ax_n.set_ylabel("non-zero columns")
-    fig.tight_layout()
-    return fig
-
-
-def plot_importance(imp: pd.DataFrame, colors: dict[str, str] | None, top_n: int) -> Figure:
-    """Top variables by mean |log-odds contribution|, coloured by family (one colour when colors is None);
-    (+) / (−): higher value, or missing, goes with more / less churn, holding the other variables fixed."""
+def plot_importance(imp: pd.DataFrame, top_n: int) -> Figure:
+    """Top variables by mean |log-odds contribution|; (+) / (−): higher value, or missing, goes with more / less
+    churn, holding the other variables fixed."""
     top = imp.head(top_n).iloc[::-1]
     labels = top.index + top["direction"].map({"+": " (+)", "-": " (−)", "": ""})
     fig, ax = plt.subplots(figsize=(8, 0.26 * top_n + 1.4))
-    color = top["family"].map(colors) if colors else SERIES[0]
-    ax.barh(labels, top["importance"], color=color, height=0.8, edgecolor=SURFACE)
+    ax.barh(labels, top["importance"], color=SERIES[0], height=0.8, edgecolor=SURFACE)
     ax.grid(axis="x")
     ax.margins(y=0.01)
     ax.set_xlabel("mean |contribution to the log-odds of churn| across customers")
-    if colors:
-        _family_legend(fig, top["family"], colors)
-    fig.tight_layout(rect=(0, 0, 1, 0.96 if colors else 1))
-    return fig
-
-
-def _percentile(values: pd.DataFrame, var: str, index: pd.Index) -> np.ndarray:
-    # Colour by rank, not raw value, so long tails and different units share one scale; NaN where there is no number.
-    if var in values and pd.api.types.is_numeric_dtype(values[var]):
-        return values.loc[index, var].rank(pct=True).to_numpy()
-    return np.full(len(index), np.nan)
-
-
-def plot_beeswarm(contrib: pd.DataFrame, values: pd.DataFrame, variables: list[str], seed: int) -> Figure:
-    """One row per variable (first on top), one dot per customer at its SHAP value, spread vertically by how many
-    customers share a similar value. Colour: the customer's value as a percentile within the variable (blue low,
-    red high); dark grey: no number (a categorical variable, or missing)."""
-    cmap = LinearSegmentedColormap.from_list("value", [SERIES[0], BASELINE, SERIES[7]])
-    rng = np.random.default_rng(seed)
-    fig, ax = plt.subplots(figsize=(8, 0.34 * len(variables) + 1.4))
-    for row, var in enumerate(reversed(variables)):
-        s = contrib[var].to_numpy()
-        bins = np.digitize(s, np.linspace(s.min(), s.max(), 60))
-        density = pd.Series(bins).map(pd.Series(bins).value_counts()).to_numpy()
-        y = row + rng.uniform(-0.4, 0.4, len(s)) * density / density.max()
-        pct = _percentile(values, var, contrib.index)
-        known = ~np.isnan(pct)
-        ax.scatter(s[~known], y[~known], s=2, color=INK2, alpha=0.3, linewidths=0, rasterized=True)
-        ax.scatter(s[known], y[known], s=2, c=pct[known], cmap=cmap, vmin=0, vmax=1, alpha=0.5, linewidths=0,
-                   rasterized=True)
-    ax.axvline(0, color=BASELINE, linewidth=1)
-    ax.set_yticks(range(len(variables)), list(reversed(variables)))
-    ax.set_ylim(-0.6, len(variables) - 0.4)
-    ax.tick_params(axis="y", length=0)
-    ax.grid(axis="x")
-    ax.set_xlabel("SHAP value: contribution to the log-odds of churn (right = more churn)")
-    bar = fig.colorbar(plt.cm.ScalarMappable(cmap=cmap), ax=ax, shrink=0.5, pad=0.02, ticks=[0, 1])
-    bar.ax.set_yticklabels(["low", "high"])
-    bar.set_label("value of the variable (percentile)")
     fig.tight_layout()
     return fig
 
@@ -272,55 +206,26 @@ def _binned_mean(x: pd.Series, s: pd.Series) -> pd.DataFrame:
     return pd.DataFrame({"x": x, "s": s}).groupby(bins, observed=True).mean()
 
 
-def plot_dependence(contrib: pd.DataFrame, values: pd.DataFrame, variables: list[str], ncols: int = 2,
-                    curves: dict[str, pd.DataFrame | list[pd.DataFrame]] | None = None,
-                    label: str | None = None) -> Figure:
+def plot_dependence(contrib: pd.DataFrame, values: pd.DataFrame, variables: list[str], ncols: int = 2) -> Figure:
     """SHAP value against the variable's own value, one panel per variable on a shared y axis: the shape of its effect
-    and its size against the others. Black line: mean SHAP per quantile bin. `curves` adds thin lines of other
-    contribution tables on the same customers (one colour per key; a list, e.g. fold refits, shares its colour), with
-    the black line as `label` in the legend. The x axis is cut at the 1st-99th percentile; missing values are not
-    shown."""
+    and its size against the others. Black line: mean SHAP per quantile bin. The x axis is cut at the 1st-99th
+    percentile; missing values are not shown."""
     nrows = math.ceil(len(variables) / ncols)
     fig, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 3.4 * nrows), sharey=True, squeeze=False)
     for ax, var in zip(axes.flat, variables):
         x, s = values[var], contrib[var]
         keep = x.between(*x.quantile([0.01, 0.99]))
         ax.scatter(x[keep], s[keep], s=3, color=MUTED, alpha=0.25, linewidths=0, rasterized=True)
-        for color, (name, tables) in zip(SERIES, (curves or {}).items()):
-            for i, other in enumerate(tables if isinstance(tables, list) else [tables]):
-                extra = _binned_mean(x[keep], other[var][keep])
-                ax.plot(extra["x"], extra["s"], color=color, linewidth=1.2, label=name if i == 0 else None)
         line = _binned_mean(x[keep], s[keep])
-        ax.plot(line["x"], line["s"], color=INK, linewidth=2, label=label)
+        ax.plot(line["x"], line["s"], color=INK, linewidth=2)
         ax.axhline(0, color=BASELINE, linewidth=1)
         missing = x.isna().mean()
         ax.set_title(var + (f" ({missing:.1%} missing, not shown)" if missing else ""))
         ax.grid(axis="y")
-    if curves:
-        axes.flat[0].legend(loc="best")
     for ax in axes.flat[len(variables):]:
         ax.set_visible(False)
     for ax in axes[:, 0]:
         ax.set_ylabel("SHAP value (log-odds)")
-    fig.tight_layout()
-    return fig
-
-
-def plot_joint(panels: dict[str, tuple[pd.DataFrame, pd.DataFrame]]) -> Figure:
-    """One panel per pair (model.joint_effect): the joint log-odds contribution against the x variable, one line per
-    value of the second. Solid: the model with the pair's tensor term; dashed, same colour: the additive model, whose
-    lines are parallel by construction. Lines that change shape, not just level, are the interaction."""
-    fig, axes = plt.subplots(len(panels), 1, figsize=(8, 3.8 * len(panels)), squeeze=False)
-    for ax, (title, (joint, additive)) in zip(axes[:, 0], panels.items()):
-        for color, (level, curve) in zip(SERIES, joint.iterrows()):
-            ax.plot(joint.columns, curve, color=color, linewidth=2, label=f"{joint.index.name} = {level:g}")
-            ax.plot(additive.columns, additive.loc[level], color=color, linewidth=1, linestyle=(0, (4, 3)))
-        ax.axhline(0, color=BASELINE, linewidth=1)
-        ax.set_title(f"{title} (dashed: the same lines without the interaction)")
-        ax.set_xlabel(joint.columns.name)
-        ax.set_ylabel("joint contribution (log-odds)")
-        ax.grid(axis="y")
-        ax.legend(loc="best", ncols=2)
     fig.tight_layout()
     return fig
 

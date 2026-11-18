@@ -5,8 +5,6 @@ import hashlib
 import numpy as np
 import pandas as pd
 from pandas.api.types import is_numeric_dtype
-from scipy.sparse.csgraph import connected_components
-from scipy.stats import chi2_contingency, false_discovery_control, mannwhitneyu
 from sklearn.metrics import mutual_info_score, roc_auc_score
 from sklearn.model_selection import StratifiedKFold
 from sklearn.preprocessing import TargetEncoder
@@ -88,24 +86,9 @@ def missing_blocks(df: pd.DataFrame, min_pct: float) -> pd.DataFrame:
 
 
 def flag_vs_churn(flags: pd.DataFrame, y: pd.Series) -> pd.DataFrame:
-    """Per boolean column (missing value, unknown code, rare value...): churn of flagged vs all other rows,
-    their odds ratio, and the chi-square p-value with Benjamini-Hochberg adjustment."""
-    rows = []
-    for col in flags.columns:
-        f = flags[col]
-        p_flag, p_rest = y[f].mean(), y[~f].mean()
-        rows.append({
-            "variable": col,
-            "n_flagged": int(f.sum()),
-            "pct_flagged": 100 * f.mean(),
-            "churn_flagged": p_flag,
-            "churn_rest": p_rest,
-            "odds_ratio": _odds(p_flag) / _odds(p_rest),
-            "p_value": chi2_contingency(pd.crosstab(f, y), correction=False).pvalue,
-        })
-    out = pd.DataFrame(rows)
-    out["p_fdr"] = false_discovery_control(out["p_value"], method="bh")
-    return out
+    """Per boolean column (e.g. a missing value): share of flagged rows, churn of flagged vs all other rows."""
+    return pd.DataFrame([{"variable": col, "pct_flagged": 100 * f.mean(), "churn_flagged": y[f].mean(),
+                          "churn_rest": y[~f].mean()} for col, f in flags.items()])
 
 
 def rank_vs_target(df: pd.DataFrame, target: str, families: pd.Series, n_bins: int, seed: int) -> pd.DataFrame:
@@ -144,30 +127,8 @@ def _auc(s: pd.Series, y: pd.Series, seed: int) -> float:
     return roc_auc_score(y, encoded.ravel())
 
 
-def tests_vs_target(df: pd.DataFrame, target: str, min_expected: float) -> pd.DataFrame:
-    """Effect size and BH-adjusted p-value per column: Mann-Whitney U with rank-biserial correlation for
-    numbers (present values only), chi-square with Cramer's V for categoricals (Missing as a level)."""
-    y = df[target].astype(bool)
-    rows = [{"variable": c} | _test(df[c], y, min_expected) for c in df.columns.drop(target)]
-    out = pd.DataFrame(rows)
-    out["p_fdr"] = false_discovery_control(out["p_value"], method="bh")
-    return out
 
 
-def _test(s: pd.Series, y: pd.Series, min_expected: float) -> dict:
-    if is_numeric_dtype(s):
-        churned, stayed = s[y].dropna(), s[~y].dropna()
-        res = mannwhitneyu(churned, stayed)
-        # Rank-biserial r = 2 * AUC - 1: > 0 means churners tend to have higher values.
-        return {"effect_size": 2 * res.statistic / (len(churned) * len(stayed)) - 1, "p_value": res.pvalue,
-                "levels_merged": 0}
-    levels = s.astype(object).fillna(MISSING)
-    counts = levels.value_counts()
-    # Chi-square needs an expected count >= min_expected in every cell: rarer levels are pooled, for the test only.
-    rare = counts.index[counts * min(y.mean(), 1 - y.mean()) < min_expected]
-    res = chi2_contingency(pd.crosstab(levels.where(~levels.isin(rare), OTHER), y), correction=False)
-    # Cramer's V with a binary target: sqrt(chi2 / n).
-    return {"effect_size": np.sqrt(res.statistic / len(s)), "p_value": res.pvalue, "levels_merged": len(rare)}
 
 
 def _bin(s: pd.Series, bins: int | list, max_levels: int | None = None) -> pd.Series:
@@ -224,17 +185,6 @@ def _odds(p):
     return p / (1 - p)
 
 
-def pick_representatives(ranking: pd.DataFrame, n: int, must_include: list[str]) -> list[str]:
-    """must_include first, then the best variable by MI of each family not yet covered."""
-    chosen = list(must_include)
-    covered = set(ranking.set_index("variable").loc[chosen, "family"])
-    for var, family in ranking.sort_values("mi", ascending=False)[["variable", "family"]].itertuples(index=False):
-        if len(chosen) >= n:
-            break
-        if family not in covered:
-            chosen.append(var)
-            covered.add(family)
-    return chosen
 
 
 def redundant_pairs(corr: pd.DataFrame, threshold: float) -> pd.DataFrame:
@@ -244,49 +194,3 @@ def redundant_pairs(corr: pd.DataFrame, threshold: float) -> pd.DataFrame:
     pairs.columns = ["var_a", "var_b", "corr"]
     pairs = pairs[pairs["corr"].abs() >= threshold]
     return pairs.sort_values("corr", key=abs, ascending=False, ignore_index=True)
-
-
-def redundancy_groups(corr: pd.DataFrame, threshold: float, families: pd.Series) -> pd.DataFrame:
-    """Groups of variables chained by |corr| >= threshold (connected components).
-
-    Members can be linked only indirectly (a~b, b~c, a and c weakly), so min_abs_corr reports the weakest
-    pair inside the group: a group is a set to inspect, not a set to drop.
-    """
-    _, labels = connected_components((corr.abs() >= threshold).to_numpy(), directed=False)
-    groups = pd.Series(labels, index=corr.index)
-    rows = []
-    for _, members in groups.groupby(groups):
-        if len(members) < 2:
-            continue
-        cols = members.index
-        within = corr.loc[cols, cols].abs().to_numpy()[np.triu_indices(len(cols), k=1)]
-        rows.append({
-            "n_variables": len(cols),
-            "min_abs_corr": within.min(),
-            "families": ", ".join(sorted(set(families[cols]))),
-            "variables": ", ".join(cols),
-        })
-    return pd.DataFrame(rows).sort_values("n_variables", ascending=False, ignore_index=True)
-
-
-def removal_candidates(rank: pd.DataFrame, corr: pd.DataFrame, extreme: float, negligible: float) -> pd.DataFrame:
-    """Variables the model comparison should try dropping, with the reason; nothing is dropped here.
-
-    Near-duplicate: walking from the highest MI down, a variable with |corr| >= extreme to one already kept,
-    so every candidate has a kept stand-in. Negligible signal: |AUC - 0.5| < negligible and MI below the median.
-    """
-    r = rank.set_index("variable")
-    reasons: dict[str, list[str]] = {}
-    kept: list[str] = []
-    for v in [v for v in r.sort_values("mi", ascending=False).index if v in corr.index]:
-        twins = corr.loc[v, kept].abs()
-        if (twins >= extreme).any():
-            reasons[v] = [f"near-duplicate of {twins.idxmax()} (rho {corr.at[v, twins.idxmax()]:.3f})"]
-        else:
-            kept.append(v)
-    weak = r[(r["auc_strength"] < negligible) & (r["mi"] < r["mi"].median())]
-    for v, strength, mi_rank in weak[["auc_strength", "rank_mi"]].itertuples():
-        reasons.setdefault(v, []).append(f"negligible signal (|AUC-0.5| {strength:.3f}, MI rank {mi_rank})")
-    out = r.loc[list(reasons), ["family", "mi", "auc_strength"]].assign(reason=[" + ".join(x) for x in reasons.values()])
-    return out.rename_axis("variable").reset_index().sort_values(["family", "mi"], ascending=[True, False],
-                                                                  ignore_index=True)

@@ -2,7 +2,8 @@
 
 Which customers of a telco are about to leave, and why. The project analyses the drivers of churn (globally and for a
 single customer), compares an interpretable elastic-net logistic regression with XGBoost, and retrains and evaluates
-both every week in an Airflow DAG running in Docker.
+both every week in an Airflow DAG running in Docker. A small API shows how one customer's risk changes when one of
+their variables changes.
 
 ## Quickstart
 
@@ -19,14 +20,15 @@ just trigger
 Without `just`: `docker compose up -d --build`, then trigger `churn_pipeline` from the UI.
 
 Churn simulation API: http://localhost:8000/docs. `POST /customers/{customer_id}/simulate` with a `variable` and its
-new `value` returns the hold-out customer's churn probability before and after the change.
+new `value` returns the hold-out customer's churn probability before and after the change. It serves the XGBoost model
+of the last DAG run (503 until the first run has finished).
 
 ## Architecture
 
 ```mermaid
 flowchart LR
     subgraph offline["Offline experiments (uv, host)"]
-        NB["notebooks: EDA, models, interpretation"]
+        NB["notebooks: EDA, model interpretation"]
         TR["train_logistic / train_xgboost<br/>Optuna on 5-fold CV of the training set"]
         MLF[("MLflow<br/>params, metrics, models")]
         TR --> MLF
@@ -44,6 +46,9 @@ flowchart LR
     EE --> DB
     EX --> DB
     PS --> DB
+    API["churn-api (FastAPI)<br/>what-if simulation"]
+    TX -. model pickle .-> API
+    P -. hold-out customers .-> API
 ```
 
 - **Tuning is offline**: Optuna searches on 5-fold CV of the training set, tracked in MLflow. The DAG refits with the
@@ -94,10 +99,11 @@ src/churn/
   data.py                  loading, conformity cleaning, stratified split
   features.py              engineered features
   pipeline.py              production pipelines and DAG steps (runtime dependencies only)
-  model.py                 CV, metrics, per-customer contributions, shared by notebooks and scripts
+  api.py                   churn simulation API (FastAPI)
+  model.py                 CV folds, metrics, TreeSHAP per customer, shared by scripts, notebooks and the DAG
   train_logistic.py        elastic-net tuning tracked in MLflow (development)
   train_xgboost.py         XGBoost feature screening and tuning tracked in MLflow (development)
-  eda.py, plots.py         EDA statistics and charts
+  eda.py, plots.py         EDA statistics; EDA and interpretation charts
 config/config.yaml         paths, column lists, hyperparameters, cuts
 notebooks/
   01_eda                   EDA on the training set
@@ -141,7 +147,12 @@ dev group.
 uv sync                  # development environment
 just test                # pytest
 just lint                # ruff
+just db                  # psql on the business database
 just mlflow-ui           # experiment runs on http://localhost:5000
+just eda                 # re-run the EDA notebook (~1.5 min)
 just logistic            # re-run the elastic-net tuning (~15 min)
+just logistic-notebook   # re-run its interpretation notebook (loads the model from MLflow)
+just xgb-screen          # compare the candidate engineered features for XGBoost (~10 min)
 just xgb                 # re-run the XGBoost tuning (~30 min)
+just xgb-notebook        # re-run its interpretation notebook (loads the model from MLflow)
 ```
