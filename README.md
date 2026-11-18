@@ -18,6 +18,9 @@ just trigger
 
 Without `just`: `docker compose up -d --build`, then trigger `churn_pipeline` from the UI.
 
+Churn simulation API: http://localhost:8000/docs. `POST /customers/{customer_id}/simulate` with a `variable` and its
+new `value` returns the hold-out customer's churn probability before and after the change.
+
 ## Architecture
 
 ```mermaid
@@ -98,8 +101,7 @@ src/churn/
 config/config.yaml         paths, column lists, hyperparameters, cuts
 notebooks/
   01_eda                   EDA on the training set
-  02-04                    exploration history: first logistic regression, XGBoost, GAM
-  05-06                    the final models: odds ratios (elastic net), SHAP (XGBoost)
+  02-03                    the final models: odds ratios (elastic net), SHAP (XGBoost)
 tests/                     pytest
 ```
 

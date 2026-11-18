@@ -212,18 +212,20 @@ def plot_cv_path(path: pd.DataFrame, best: pd.Series, chosen: pd.Series, by: str
     return fig
 
 
-def plot_importance(imp: pd.DataFrame, colors: dict[str, str], top_n: int) -> Figure:
-    """Top variables by mean |log-odds contribution|, coloured by family; (+) / (−): higher value, or missing,
-    goes with more / less churn, holding the other variables fixed."""
+def plot_importance(imp: pd.DataFrame, colors: dict[str, str] | None, top_n: int) -> Figure:
+    """Top variables by mean |log-odds contribution|, coloured by family (one colour when colors is None);
+    (+) / (−): higher value, or missing, goes with more / less churn, holding the other variables fixed."""
     top = imp.head(top_n).iloc[::-1]
     labels = top.index + top["direction"].map({"+": " (+)", "-": " (−)", "": ""})
     fig, ax = plt.subplots(figsize=(8, 0.26 * top_n + 1.4))
-    ax.barh(labels, top["importance"], color=top["family"].map(colors), height=0.8, edgecolor=SURFACE)
+    color = top["family"].map(colors) if colors else SERIES[0]
+    ax.barh(labels, top["importance"], color=color, height=0.8, edgecolor=SURFACE)
     ax.grid(axis="x")
     ax.margins(y=0.01)
     ax.set_xlabel("mean |contribution to the log-odds of churn| across customers")
-    _family_legend(fig, top["family"], colors)
-    fig.tight_layout(rect=(0, 0, 1, 0.96))
+    if colors:
+        _family_legend(fig, top["family"], colors)
+    fig.tight_layout(rect=(0, 0, 1, 0.96 if colors else 1))
     return fig
 
 

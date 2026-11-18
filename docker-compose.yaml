@@ -51,6 +51,23 @@ services:
       start_period: 5s
     restart: always
 
+  # Churn simulation API on the model the DAG trained: Swagger on http://localhost:8000/docs. The Airflow image already has
+  # FastAPI and uvicorn (Airflow 3's API server is built on them); the entrypoint skips Airflow's own start-up.
+  churn-api:
+    build: .
+    image: churn-airflow
+    entrypoint: ["python", "-m", "uvicorn", "churn.api:app", "--host", "0.0.0.0", "--port", "8000"]
+    environment:
+      PYTHONPATH: /opt/airflow/src
+    # Read-only: the API only reads the model, the hold-out and the config.
+    volumes:
+      - ./src:/opt/airflow/src:ro
+      - ./config:/opt/airflow/config:ro
+      - ./data:/opt/airflow/data:ro
+    ports:
+      - "8000:8000"
+    restart: always
+
   postgres:
     image: postgres:16
     environment:
