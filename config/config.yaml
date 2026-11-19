@@ -3,7 +3,9 @@ paths:
   # Files the DAG tasks hand to each other on the shared volume; every run overwrites them.
   train: data/processed/train.pkl
   test: data/processed/test.pkl
-  model: data/models/elasticnet.pkl
+  # Each run trains a candidate; it replaces xgb_model, the model the scores and the API use, only if it passes the
+  # quality gate.
+  xgb_candidate: data/models/candidate/xgboost.pkl
   xgb_model: data/models/xgboost.pkl
 
 target: churn
@@ -91,11 +93,6 @@ logreg:
   # Cut points of the engineered features, read from the EDA on the training set.
   old_handset_days: 300
   first_year_end_months: [11, 12]
-  # Production: the model chosen by python -m churn.train_logistic (best CV PR-AUC, engineered features kept). The
-  # weekly DAG refits it on the training rows with these values; tuning stays an offline experiment.
-  # min_pr_auc is the quality gate: the DAG fails if the hold-out PR-AUC falls below the CV mean - 2 fold SDs
-  # (0.6469 - 2 x 0.0054).
-  final: {C: 0.1575, l1_ratio: 0.539, features: true, min_pr_auc: 0.636}
 
 # XGBoost tracked in MLflow (python -m churn.train_xgboost): the same folds, metric (CV PR-AUC), Optuna search and
 # rule for engineered features as logreg above, so the two models are compared on equal terms.
@@ -155,7 +152,7 @@ xgb:
              colsample_bytree: 0.7944451595983506, reg_lambda: 3.8852378493680124}
     features: true
     threshold: 0.4305405020713806   # max out-of-fold recall with precision >= min_precision
-    min_pr_auc: 0.678               # quality gate: CV mean - 2 fold SDs (0.6903 - 2 x 0.0060)
+    min_pr_auc: 0.678             # quality gate: CV mean - 2 fold SDs (0.6903 - 2 x 0.0060)
     # Threads for the DAG fit, fixed instead of "all cores": XGBoost sums its histograms per thread, so the result
     # depends on the thread count (8 threads: hold-out PR-AUC +0.00014). 16 = the offline run's thread count; fixed,
     # it gives the same model on a machine with any number of cores (only slower on fewer).

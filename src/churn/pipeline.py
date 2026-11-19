@@ -1,5 +1,6 @@
-"""The production models (elastic net, XGBoost) and the steps of the Airflow DAG: prepare the data, train each model,
-evaluate it on the hold-out, publish the churn scores.
+"""The two models (elastic net, explored offline; XGBoost, in production) and the steps of the Airflow DAG: prepare the
+data, train an XGBoost candidate, evaluate it on the hold-out, promote it if it passes the quality gate, publish the
+churn scores.
 
 Steps hand data to each other as files on the shared volume: each one returns the path it wrote. They need only the
 runtime dependencies, so the Airflow image can import this module (mlflow, optuna and matplotlib are development-only).
@@ -128,28 +129,23 @@ def _save(pipe: Pipeline, cfg: dict, key: str) -> str:
     return str(path)
 
 
-def train_elasticnet(cfg: dict, train_path: str) -> str:
-    """Fit the elastic net with the frozen hyperparameters on the training rows; pickle the whole pipeline."""
-    X, y = split_xy(pd.read_pickle(train_path), cfg)
-    final = cfg["logreg"]["final"]
-    return _save(build_pipeline(cfg, final["C"], final["l1_ratio"], final["features"]).fit(X, y), cfg, "model")
-
-
 def train_xgboost(cfg: dict, train_path: str) -> str:
-    """Fit XGBoost with the frozen hyperparameters on the training rows; pickle the whole pipeline."""
+    """Fit XGBoost with the frozen hyperparameters on the training rows and pickle the whole pipeline as the candidate:
+    the production model stays untouched until the candidate passes the quality gate."""
     X, y = split_xy(pd.read_pickle(train_path), cfg)
     final = cfg["xgb"]["final"]
     params = {**final["params"], "n_jobs": final["n_jobs"]}
     pipe = build_xgb_pipeline(cfg, params, xgb_formulas(cfg) if final["features"] else None).fit(X, y)
-    return _save(pipe, cfg, "xgb_model")
+    return _save(pipe, cfg, "xgb_candidate")
 
 
-def _describe(model) -> str:
-    if isinstance(model, XGBClassifier):
-        return (f"XGBoost, {model.n_estimators} trees, max depth {model.max_depth}, "
-                f"learning rate {model.learning_rate}")
-    return (f"elastic net, C {model.C:.4g}, l1_ratio {model.l1_ratio:.3g}, "
-            f"{(model.coef_ != 0).sum()} of {model.coef_.size} columns non-zero")
+def promote(cfg: dict, candidate_path: str) -> str:
+    """Make the candidate that passed the quality gate the production model. os.replace is atomic: the API and the
+    scores read either the previous model or the new one, never a half-written file."""
+    path = _output(cfg, "xgb_model")
+    os.replace(candidate_path, path)
+    log.info("candidate promoted: %s is the production model", path)
+    return str(path)
 
 
 def _load(path: str) -> Pipeline:
@@ -183,7 +179,9 @@ def evaluate(cfg: dict, model_path: str, train_path: str, test_path: str, thresh
     for name, df in [("train", pd.read_pickle(train_path)), ("test", test)]:
         log.info("%-5s %6d rows, churn rate %.3f", name, len(df), df[cfg["target"]].mean())
     # The hyperparameters are read from the pickled model, so the log states what was actually scored.
-    log.info("model: %s, engineered features %s", _describe(pipe[-1]), "features" in pipe.named_steps)
+    m = pipe[-1]
+    log.info("model: XGBoost, %d trees, max depth %d, learning rate %s, engineered features %s", m.n_estimators,
+             m.max_depth, m.learning_rate, "features" in pipe.named_steps)
     X, y = split_xy(test, cfg)
     proba = pipe.predict_proba(X)[:, 1]
     scores = {**metrics(y, proba, threshold), "brier": brier_score_loss(y, proba)}

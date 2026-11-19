@@ -1,9 +1,9 @@
 # Telco churn: drivers, model and weekly pipeline
 
 Which customers of a telco are about to leave, and why. The project analyses the drivers of churn (globally and for a
-single customer), compares an interpretable elastic-net logistic regression with XGBoost, and retrains and evaluates
-both every week in an Airflow DAG running in Docker. A small API shows how one customer's risk changes when one of
-their variables changes.
+single customer), compares an interpretable elastic-net logistic regression with XGBoost, and every week retrains,
+evaluates and promotes the XGBoost model in an Airflow DAG running in Docker. A small API shows how one customer's risk
+changes when one of their variables changes.
 
 ## Quickstart
 
@@ -20,8 +20,8 @@ just trigger
 Without `just`: `docker compose up -d --build`, then trigger `churn_pipeline` from the UI.
 
 Churn simulation API: http://localhost:8000/docs. `POST /customers/{customer_id}/simulate` with a `variable` and its
-new `value` returns the hold-out customer's churn probability before and after the change. It serves the XGBoost model
-of the last DAG run (503 until the first run has finished).
+new `value` returns the hold-out customer's churn probability before and after the change. It serves the last XGBoost
+model the DAG promoted (503 until the first run has finished).
 
 ## Architecture
 
@@ -36,18 +36,16 @@ flowchart LR
     CFG["config/config.yaml<br/>frozen hyperparameters, cuts, quality gates"]
     TR --> CFG
     subgraph docker["Docker: Airflow 3, LocalExecutor"]
-        P[prepare_data] --> TE[train_elasticnet] --> EE[evaluate_elasticnet]
-        P --> TX[train_xgboost] --> EX[evaluate_xgboost] --> PS[publish_scores]
+        P[prepare_data] --> TX[train_xgboost] --> EX[evaluate_xgboost] --> PR[promote_xgboost] --> PS[publish_scores]
     end
     CSV[("data/raw/dataset.csv")] --> P
     CFG --> docker
     DB[("churn-db (Postgres)<br/>split, model_metrics, churn_scores")]
     P --> DB
-    EE --> DB
     EX --> DB
     PS --> DB
     API["churn-api (FastAPI)<br/>what-if simulation"]
-    TX -. model pickle .-> API
+    PR -. approved model pickle .-> API
     P -. hold-out customers .-> API
 ```
 
@@ -58,10 +56,13 @@ flowchart LR
 - **The DAG only orchestrates**: the logic lives in `src/churn/`. Tasks hand each other file paths through XCom, while
   the data stays on the shared volume. The split is stratified with a fixed seed, so every run holds out the same
   20% of customers.
-- **Quality gate**: each evaluate task logs the hold-out metrics and fails if the PR-AUC drops below the CV mean minus
-  2 fold standard deviations. Tasks retry once for transient errors; evaluate never retries, because a missed gate
-  would only fail again. `publish_scores` runs only if XGBoost passes, so a worse model never reaches the
-  retention list.
+- **Only XGBoost runs in production**: the elastic net was the interpretable benchmark of the analysis
+  (`train_logistic`, notebook 02) and stays offline.
+- **Quality gate and promotion**: `train_xgboost` writes a candidate next to the production model. `evaluate_xgboost`
+  logs its hold-out metrics and fails if the PR-AUC drops below the CV mean minus 2 fold standard deviations. Only a
+  candidate that passes is promoted (an atomic file replace) and scored, so a worse model never reaches the API or the
+  retention list. Tasks retry once for transient errors; evaluate never retries, because a missed gate would only fail
+  again.
 
 ## Database
 
@@ -72,7 +73,7 @@ any SQL client on `localhost:5433` (user, password and database: `churn`).
 | Table | Written by | Content |
 |---|---|---|
 | `split` | `prepare_data` (replaced) | Each customer and its set (train / test): an intermediate result to join other tables to |
-| `model_metrics` | `evaluate_*` (appended) | One row per run and model: hold-out metrics, cut, quality-gate minimum, passed. Failed runs are recorded too |
+| `model_metrics` | `evaluate_xgboost` (appended) | One row per run: hold-out metrics of the candidate, cut, quality-gate minimum, passed (= promoted). Failed runs are recorded too |
 | `churn_scores` | `publish_scores` (replaced) | The current list: churn probability, flag at the cut, the variable pushing the customer's risk up the most (TreeSHAP), and a suggested retention action for flagged customers |
 
 ```sql
@@ -147,7 +148,10 @@ dev group.
 uv sync                  # development environment
 just test                # pytest
 just lint                # ruff
+just --list --unsorted   # every recipe; the "presentation" group is the live demo, in order
+just airflow-ui          # Airflow UI in the browser
 just db                  # psql on the business database
+just swagger             # simulation API in the browser (example values in the justfile)
 just mlflow-ui           # experiment runs on http://localhost:5000
 just eda                 # re-run the EDA notebook (~1.5 min)
 just logistic            # re-run the elastic-net tuning (~15 min)
